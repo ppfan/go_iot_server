@@ -1,0 +1,16 @@
+services:
+  iot_server:
+    build: .
+    container_name: iot_server_go
+    restart: unless-stopped
+    ports:
+      - "9090:9090" # Callback receiver
+      - "9091:9091" # Raw TCP Speedtest
+      - "8000:8000" # Dashboard REST API
+    environment:
+      - APP_DEBUG=false
+      - APP_HMAC_PROD_KEY=change_this_to_prod_key
+      - APP_HMAC_DEV_KEY=dev_secret_change_in_production
+      - CALLBACK_PORT=9090
+      - SPEEDTEST_PORT=9091
+      - DASHBOARD_PORT=8000
