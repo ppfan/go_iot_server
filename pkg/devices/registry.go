@@ -15,8 +15,8 @@ type state struct {
 	lastError     string
 }
 
-// Registry tracks runtime state for devices listed in the fleet vault only;
-// unknown senders never create entries.
+// Registry tracks runtime state for devices in the fleet vault only; unknown
+// senders never create entries. Devices added at runtime get state on first use.
 type Registry struct {
 	vault        *fleet.Vault
 	onlineWindow time.Duration
@@ -29,19 +29,21 @@ type Registry struct {
 // NewRegistry builds a registry. tunnelUp may be nil; when it reports false,
 // every device is shown offline regardless of when it was last seen.
 func NewRegistry(v *fleet.Vault, onlineWindow time.Duration, tunnelUp func() bool) *Registry {
-	r := &Registry{vault: v, onlineWindow: onlineWindow, tunnelUp: tunnelUp, state: make(map[string]*state)}
-	for _, id := range v.IDs() {
-		r.state[id] = &state{}
-	}
-	return r
+	return &Registry{vault: v, onlineWindow: onlineWindow, tunnelUp: tunnelUp, state: make(map[string]*state)}
 }
 
 func (r *Registry) update(id string, fn func(*state)) {
+	if _, ok := r.vault.Get(id); !ok {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if s, ok := r.state[id]; ok {
-		fn(s)
+	s, ok := r.state[id]
+	if !ok {
+		s = &state{}
+		r.state[id] = s
 	}
+	fn(s)
 }
 
 func (r *Registry) MarkSeen(id string) {
@@ -70,9 +72,12 @@ func (r *Registry) List() []models.DeviceInfo {
 	defer r.mu.RUnlock()
 	for _, id := range ids {
 		d, ok := r.vault.Get(id)
-		s := r.state[id]
-		if !ok || s == nil {
+		if !ok {
 			continue
+		}
+		s := r.state[id]
+		if s == nil {
+			s = &state{}
 		}
 		info := models.DeviceInfo{
 			ID:            id,
