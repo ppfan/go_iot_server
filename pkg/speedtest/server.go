@@ -1,93 +1,137 @@
+// Package speedtest implements the raw TCP sink/source used by main/speedtest.c.
+//
+// Protocol: the device connects and sends one line, "DOWNLOAD:<sec>\n" or
+// "UPLOAD:<sec>\n". DOWNLOAD → the server streams data for <sec> seconds and
+// closes. UPLOAD → the server reads until EOF. Mode "both" is two connections.
 package speedtest
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// Server handles high-throughput raw TCP speed tests with minimal allocations.
+const (
+	maxDurationSec = 15 // same bound as data_server.c
+	maxConcurrent  = 4
+	chunkSize      = 1440 // fits in one WireGuard packet
+)
+
 type Server struct {
-	port       int
-	bufferPool *sync.Pool
-	bytesRecv  atomic.Uint64
-	bytesSent  atomic.Uint64
+	allowed func(netip.Addr) bool
+	sem     chan struct{}
+	pool    sync.Pool
 }
 
-// NewServer initializes the speedtest server with a reusable buffer pool.
-func NewServer(port int) *Server {
-	return &Server{
-		port: port,
-		bufferPool: &sync.Pool{
-			New: func() interface{} {
-				// 64 KB recycled chunk buffer
-				buf := make([]byte, 64*1024)
-				return &buf
-			},
-		},
+// NewServer accepts connections only from addresses for which allowed returns true.
+func NewServer(allowed func(netip.Addr) bool) *Server {
+	s := &Server{allowed: allowed, sem: make(chan struct{}, maxConcurrent)}
+	s.pool.New = func() any {
+		b := make([]byte, 64*1024)
+		for i := range b {
+			b[i] = 'X'
+		}
+		return &b
 	}
+	return s
 }
 
-// Start listens for speedtest TCP connections from ESP32 devices.
-func (s *Server) Start(ctx context.Context) error {
-	addr := fmt.Sprintf("0.0.0.0:%d", s.port)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("speedtest listener failed on %s: %w", addr, err)
-	}
-	defer listener.Close()
-
-	log.Printf("[Speedtest] Raw TCP speedtest server listening on :%d", s.port)
-
+// Serve accepts connections on ln until ctx is cancelled.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
-		listener.Close()
+		ln.Close()
 	}()
-
 	for {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return nil
-			default:
-				log.Printf("[Speedtest] Accept error: %v", err)
-				continue
 			}
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			log.Printf("[speedtest] accept: %v", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-
-		go s.handleConnection(conn)
+		src, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
+		if !s.allowed(src.Addr().Unmap()) {
+			log.Printf("[speedtest] refused %s: not a fleet device", src.Addr())
+			conn.Close()
+			continue
+		}
+		select {
+		case s.sem <- struct{}{}:
+			go func() {
+				defer func() { <-s.sem }()
+				s.handle(conn)
+			}()
+		default:
+			log.Printf("[speedtest] busy, refused %s", src.Addr())
+			conn.Close()
+		}
 	}
 }
 
-func (s *Server) handleConnection(conn net.Conn) {
-	defer conn.Close()
+func parseRequest(line string) (mode string, sec int, err error) {
+	mode, num, ok := strings.Cut(strings.TrimSpace(line), ":")
+	if !ok || (mode != "DOWNLOAD" && mode != "UPLOAD") {
+		return "", 0, fmt.Errorf("bad request %q", line)
+	}
+	sec, err = strconv.Atoi(num)
+	if err != nil || sec < 1 || sec > maxDurationSec {
+		return "", 0, fmt.Errorf("bad duration %q", num)
+	}
+	return mode, sec, nil
+}
 
-	// Recycled buffer from pool
-	bufPtr := s.bufferPool.Get().(*[]byte)
-	defer s.bufferPool.Put(bufPtr)
+func (s *Server) handle(conn net.Conn) {
+	defer conn.Close()
+	peer := conn.RemoteAddr().String()
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := bufio.NewReaderSize(io.LimitReader(conn, 32), 32).ReadString('\n')
+	if err != nil {
+		log.Printf("[speedtest] %s: no request line: %v", peer, err)
+		return
+	}
+	mode, sec, err := parseRequest(line)
+	if err != nil {
+		log.Printf("[speedtest] %s: %v", peer, err)
+		return
+	}
+
+	bufPtr := s.pool.Get().(*[]byte)
+	defer s.pool.Put(bufPtr)
 	buf := *bufPtr
 
-	// Read initial mode header if applicable, or stream bytes
-	conn.SetDeadline(time.Now().Add(20 * time.Second))
-
-	totalRead := 0
-	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			totalRead += n
-			s.bytesRecv.Add(uint64(n))
-		}
-		if err != nil {
-			if err != io.EOF {
-				// Socket closed or timeout
+	start := time.Now()
+	var n int64
+	switch mode {
+	case "DOWNLOAD":
+		conn.SetWriteDeadline(start.Add(time.Duration(sec)*time.Second + 5*time.Second))
+		end := start.Add(time.Duration(sec) * time.Second)
+		for time.Now().Before(end) {
+			w, err := conn.Write(buf[:chunkSize])
+			n += int64(w)
+			if err != nil {
+				break
 			}
-			break
 		}
+	case "UPLOAD":
+		conn.SetReadDeadline(start.Add(time.Duration(sec)*time.Second + 10*time.Second))
+		n, _ = io.CopyBuffer(io.Discard, conn, buf)
 	}
+	elapsed := time.Since(start).Seconds()
+	log.Printf("[speedtest] %s %s: %d bytes in %.2fs (%.2f Mbps)", peer, mode, n, elapsed, float64(n)*8/1e6/elapsed)
 }

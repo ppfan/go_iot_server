@@ -1,116 +1,94 @@
 package devices
 
 import (
-	"bytes"
-	"context"
-	"crypto/tls"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 
-	"iot_server_go/pkg/crypto"
+	"iot_server_go/pkg/fleet"
 	"iot_server_go/pkg/models"
 )
 
-// Registry manages thread-safe tracking of dozens to hundreds of ESP32 devices.
+type state struct {
+	lastSeen      time.Time
+	lastTelemetry *models.TelemetryPayload
+	lastSpeedtest *models.SpeedtestResult
+	lastError     string
+}
+
+// Registry tracks runtime state for devices listed in the fleet vault only;
+// unknown senders never create entries.
 type Registry struct {
-	mu         sync.RWMutex
-	devices    map[string]*models.DeviceInfo
-	httpClient *http.Client
-	secret     string
+	vault        *fleet.Vault
+	onlineWindow time.Duration
+	tunnelUp     func() bool
+
+	mu    sync.RWMutex
+	state map[string]*state
 }
 
-// NewRegistry initializes a device registry with custom HTTP transport tuned for IoT concurrency.
-func NewRegistry(secret string) *Registry {
-	transport := &http.Transport{
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // Self-signed device certs inside WireGuard
-		MaxIdleConns:        500,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     60 * time.Second,
+// NewRegistry builds a registry. tunnelUp may be nil; when it reports false,
+// every device is shown offline regardless of when it was last seen.
+func NewRegistry(v *fleet.Vault, onlineWindow time.Duration, tunnelUp func() bool) *Registry {
+	r := &Registry{vault: v, onlineWindow: onlineWindow, tunnelUp: tunnelUp, state: make(map[string]*state)}
+	for _, id := range v.IDs() {
+		r.state[id] = &state{}
 	}
-
-	return &Registry{
-		devices: make(map[string]*models.DeviceInfo),
-		httpClient: &http.Client{
-			Transport: transport,
-			Timeout:   10 * time.Second,
-		},
-		secret: secret,
-	}
+	return r
 }
 
-// RecordTelemetry updates or registers a device upon receiving incoming telemetry.
-func (r *Registry) RecordTelemetry(ip string, t *models.TelemetryPayload) {
+func (r *Registry) update(id string, fn func(*state)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	id := ip
-	if t.IP != "" {
-		id = t.IP
+	if s, ok := r.state[id]; ok {
+		fn(s)
 	}
-
-	dev, exists := r.devices[id]
-	if !exists {
-		dev = &models.DeviceInfo{
-			ID: id,
-			IP: ip,
-		}
-		r.devices[id] = dev
-	}
-
-	dev.LastSeen = time.Now()
-	dev.IsOnline = true
-	dev.LastTelemetry = t
 }
 
-// ListDevices returns a snapshot of all registered devices.
-func (r *Registry) ListDevices() []*models.DeviceInfo {
+func (r *Registry) MarkSeen(id string) {
+	r.update(id, func(s *state) { s.lastSeen = time.Now(); s.lastError = "" })
+}
+
+func (r *Registry) MarkError(id string, err error) {
+	r.update(id, func(s *state) { s.lastError = err.Error() })
+}
+
+func (r *Registry) RecordTelemetry(id string, t *models.TelemetryPayload) {
+	r.update(id, func(s *state) { s.lastSeen = time.Now(); s.lastError = ""; s.lastTelemetry = t })
+}
+
+func (r *Registry) RecordSpeedtest(id string, res *models.SpeedtestResult) {
+	r.update(id, func(s *state) { s.lastSeen = time.Now(); s.lastSpeedtest = res })
+}
+
+// List returns a snapshot of all devices, sorted by ID.
+func (r *Registry) List() []models.DeviceInfo {
+	tunnelUp := r.tunnelUp == nil || r.tunnelUp()
+	ids := r.vault.IDs()
+	out := make([]models.DeviceInfo, 0, len(ids))
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
-	list := make([]*models.DeviceInfo, 0, len(r.devices))
-	for _, dev := range r.devices {
-		// Deep copy snapshot
-		copyDev := *dev
-		list = append(list, &copyDev)
+	for _, id := range ids {
+		d, ok := r.vault.Get(id)
+		s := r.state[id]
+		if !ok || s == nil {
+			continue
+		}
+		info := models.DeviceInfo{
+			ID:            id,
+			IP:            d.IP.String(),
+			KeyID:         d.KeyID,
+			RotationOpen:  d.RotationPending,
+			LastTelemetry: s.lastTelemetry,
+			LastSpeedtest: s.lastSpeedtest,
+			LastError:     s.lastError,
+		}
+		if !s.lastSeen.IsZero() {
+			seen := s.lastSeen
+			info.LastSeen = &seen
+			info.IsOnline = tunnelUp && time.Since(seen) < r.onlineWindow
+		}
+		out = append(out, info)
 	}
-	return list
-}
-
-// SendHTTPCommand sends an authenticated HMAC-signed HTTP POST command to an ESP32 HTTPS endpoint.
-func (r *Registry) SendHTTPCommand(ctx context.Context, targetIP string, port int, payload map[string]interface{}) ([]byte, error) {
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal command: %w", err)
-	}
-
-	url := fmt.Sprintf("https://%s:%d/data", targetIP, port)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	sig := crypto.ComputeHMAC(r.secret, bodyBytes)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Signature-SHA256", sig)
-
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return respBody, fmt.Errorf("device responded with HTTP %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	return respBody, nil
+	return out
 }

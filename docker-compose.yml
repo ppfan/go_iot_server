@@ -1,16 +1,49 @@
+# Control Room (10.10.0.2) — the server runs only inside the WireGuard tunnel.
+# Stop the Python stack in ../esp32_wg_http/pc_server first: both use the same
+# WireGuard identity and 127.0.0.1:8000.
 services:
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: iot_wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+    volumes:
+      # wg_confs/wg0.conf: Address = 10.10.0.2/24, peer = relay 144.126.225.130:51820
+      - ${WG_CONFIG_DIR:-../esp32_wg_http/pc_server/wireguard}:/config
+      - /lib/modules:/lib/modules:ro
+    ports:
+      # Only WireGuard is reachable from outside.
+      - "51820:51820/udp"
+      # Dashboard API, host loopback only (the server also binds it inside the tunnel netns).
+      - "127.0.0.1:8000:8000"
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
+
   iot_server:
     build: .
     container_name: iot_server_go
     restart: unless-stopped
-    ports:
-      - "9090:9090" # Callback receiver
-      - "9091:9091" # Raw TCP Speedtest
-      - "8000:8000" # Dashboard REST API
+    network_mode: "service:wireguard"
+    depends_on:
+      - wireguard
+    cap_add:
+      - NET_ADMIN # wgctrl: read wg0 handshake state
+    env_file:
+      - .env
     environment:
-      - APP_DEBUG=false
-      - APP_HMAC_PROD_KEY=change_this_to_prod_key
-      - APP_HMAC_DEV_KEY=dev_secret_change_in_production
-      - CALLBACK_PORT=9090
-      - SPEEDTEST_PORT=9091
-      - DASHBOARD_PORT=8000
+      - CONTROL_ROOM_IP=10.10.0.2
+      - DASHBOARD_ADDR=0.0.0.0:8000
+      - FLEET_KEYS_FILE=/data/fleet_keys.json
+      - CA_CERT_FILE=/certs/ca_cert.pem
+      - TLS_CERT_FILE=/certs/server_cert.pem
+      - TLS_KEY_FILE=/certs/server_key.pem
+    volumes:
+      - ${CERTS_DIR:-../esp32_wg_http/pc_server/certs}:/certs:ro
+      # Read-write: key rotation updates it in place.
+      - ${FLEET_KEYS:-../esp32_wg_http/pc_server/fleet_keys.json}:/data/fleet_keys.json

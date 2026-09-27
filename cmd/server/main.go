@@ -2,221 +2,162 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/tls"
+	"errors"
 	"fmt"
-	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
-	"iot_server_go/pkg/crypto"
+	"iot_server_go/pkg/api"
+	"iot_server_go/pkg/callback"
 	"iot_server_go/pkg/devices"
-	"iot_server_go/pkg/models"
+	"iot_server_go/pkg/fleet"
 	"iot_server_go/pkg/speedtest"
+	"iot_server_go/pkg/wghealth"
 )
 
-func getEnv(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return defaultVal
+	return def
 }
 
-func getActiveSecret() string {
-	isDebug := strings.ToLower(os.Getenv("APP_DEBUG")) == "true"
-	if isDebug {
-		if sec := os.Getenv("APP_HMAC_DEV_KEY"); sec != "" {
-			return sec
+func getDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Fatalf("%s: %v", key, err)
 		}
-	} else {
-		if sec := os.Getenv("APP_HMAC_PROD_KEY"); sec != "" {
-			return sec
+		return d
+	}
+	return def
+}
+
+// listen retries while the address is not assigned yet: wg0 may come up after
+// this process starts when both share the WireGuard container's network.
+func listen(ctx context.Context, addr string, wait time.Duration) (net.Listener, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil || !errors.Is(err, syscall.EADDRNOTAVAIL) || time.Now().After(deadline) {
+			return ln, err
+		}
+		log.Printf("waiting for %s to become available...", addr)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
 		}
 	}
-	if sec := os.Getenv("APP_HMAC_SHARED_SECRET"); sec != "" {
-		return sec
+}
+
+func newHTTPServer(h http.Handler, writeTimeout time.Duration) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    8 << 10,
 	}
-	// Fallback development default
-	return "dev_secret_change_in_production"
 }
 
 func main() {
-	secret := getActiveSecret()
-	callbackPort := getEnv("CALLBACK_PORT", "9090")
-	speedtestPort, _ := strconv.Atoi(getEnv("SPEEDTEST_PORT", "9091"))
-	dashboardPort := getEnv("DASHBOARD_PORT", "8000")
+	controlIP := getEnv("CONTROL_ROOM_IP", "10.10.0.2")
+	callbackAddr := net.JoinHostPort(controlIP, getEnv("CALLBACK_PORT", "9090"))
+	speedtestAddr := net.JoinHostPort(controlIP, getEnv("SPEEDTEST_PORT", "9091"))
+	dashboardAddr := getEnv("DASHBOARD_ADDR", "127.0.0.1:8000")
+	devicePort, err := strconv.Atoi(getEnv("DEVICE_PORT", "8443"))
+	if err != nil {
+		log.Fatalf("DEVICE_PORT: %v", err)
+	}
+	token := os.Getenv("DASHBOARD_TOKEN")
+	if len(token) < 32 {
+		log.Fatal("DASHBOARD_TOKEN must be set to at least 32 characters (e.g. `openssl rand -hex 32`)")
+	}
+
+	vault, err := fleet.Load(getEnv("FLEET_KEYS_FILE", "fleet_keys.json"))
+	if err != nil {
+		log.Fatalf("fleet registry: %v", err)
+	}
+	caPEM, err := os.ReadFile(getEnv("CA_CERT_FILE", "certs/ca_cert.pem"))
+	if err != nil {
+		log.Fatalf("CA certificate: %v", err)
+	}
+	deviceTLS, err := devices.NewTLSConfig(caPEM)
+	if err != nil {
+		log.Fatalf("CA certificate: %v", err)
+	}
+	serverCert, err := tls.LoadX509KeyPair(getEnv("TLS_CERT_FILE", "certs/server_cert.pem"), getEnv("TLS_KEY_FILE", "certs/server_key.pem"))
+	if err != nil {
+		log.Fatalf("callback TLS certificate: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	tunnel := wghealth.New(getEnv("WG_INTERFACE", "wg0"))
+	go tunnel.Run(ctx, 10*time.Second)
+
+	registry := devices.NewRegistry(vault, getDuration("ONLINE_WINDOW", 3*time.Minute), tunnel.Up)
+	client := devices.NewClient(vault, registry, devicePort, deviceTLS)
 
 	log.Printf("==================================================")
-	log.Printf("Starting Go IoT Fleet Server")
-	log.Printf("Callback Port : %s", callbackPort)
-	log.Printf("Speedtest Port: %d", speedtestPort)
-	log.Printf("Dashboard Port: %s", dashboardPort)
-	log.Printf("Debug Mode    : %s", getEnv("APP_DEBUG", "false"))
+	log.Printf("Go IoT Fleet Server (Control Room %s)", controlIP)
+	log.Printf("Devices   : %d registered", len(vault.IDs()))
+	log.Printf("Callback  : https://%s/callback", callbackAddr)
+	log.Printf("Speedtest : tcp://%s", speedtestAddr)
+	log.Printf("Dashboard : http://%s", dashboardAddr)
 	log.Printf("==================================================")
 
-	registry := devices.NewRegistry(secret)
-	ctx, cancel := context.WithCancel(context.Background())
+	listenWait := getDuration("LISTEN_WAIT", 60*time.Second)
+	cbLn, err := listen(ctx, callbackAddr, listenWait)
+	if err != nil {
+		log.Fatalf("callback listener: %v (is WireGuard up with %s?)", err, controlIP)
+	}
+	stLn, err := listen(ctx, speedtestAddr, listenWait)
+	if err != nil {
+		log.Fatalf("speedtest listener: %v", err)
+	}
+	dashLn, err := listen(ctx, dashboardAddr, listenWait)
+	if err != nil {
+		log.Fatalf("dashboard listener: %v", err)
+	}
+
+	callbackSrv := newHTTPServer(callback.Handler(vault, registry), 10*time.Second)
+	callbackSrv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{serverCert}, MinVersion: tls.VersionTLS12}
+	dashboardSrv := newHTTPServer((&api.Server{
+		Token: token, Vault: vault, Registry: registry, Client: client, Tunnel: tunnel,
+	}).Handler(), 30*time.Second)
+
+	errc := make(chan error, 3)
+	go func() { errc <- fmt.Errorf("callback: %w", callbackSrv.ServeTLS(cbLn, "", "")) }()
+	go func() { errc <- fmt.Errorf("dashboard: %w", dashboardSrv.Serve(dashLn)) }()
+	go func() {
+		errc <- fmt.Errorf("speedtest: %w", speedtest.NewServer(vault.IsDeviceIP).Serve(ctx, stLn))
+	}()
+	if every := getDuration("POLL_INTERVAL", time.Minute); every > 0 {
+		go client.Poll(ctx, every, 8)
+	}
+
+	select {
+	case <-ctx.Done():
+	case err := <-errc:
+		log.Printf("server stopped: %v", err)
+	}
+	stop()
+
+	log.Println("Shutting down...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	// 1. Start raw TCP speed test sink
-	speedtestServer := speedtest.NewServer(speedtestPort)
-	go func() {
-		if err := speedtestServer.Start(ctx); err != nil {
-			log.Fatalf("Speedtest server error: %v", err)
-		}
-	}()
-
-	// 2. Start Callback Receiver (Port 9090)
-	callbackMux := http.NewServeMux()
-	callbackMux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		body, err := io.ReadAll(io.LimitReader(r.Body, 8192))
-		if err != nil {
-			http.Error(w, "Failed to read body", http.StatusBadRequest)
-			return
-		}
-
-		sig := r.Header.Get("X-Signature-SHA256")
-		verified := crypto.VerifyHMAC(secret, body, sig)
-		if !verified {
-			log.Printf("[Callback] WARNING: Invalid signature from %s", r.RemoteAddr)
-			http.Error(w, "Bad signature", http.StatusUnauthorized)
-			return
-		}
-
-		var payload models.TelemetryPayload
-		if err := json.Unmarshal(body, &payload); err == nil {
-			// Extract IP from remote addr if not in JSON
-			remoteIP := r.RemoteAddr
-			if idx := strings.LastIndex(remoteIP, ":"); idx != -1 {
-				remoteIP = remoteIP[:idx]
-			}
-			registry.RecordTelemetry(remoteIP, &payload)
-			log.Printf("[Callback] Telemetry from %s | Uptime: %ds | Heap: %d B | Relay: %v",
-				remoteIP, payload.UptimeS, payload.FreeHeap, payload.RelayState)
-		} else {
-			log.Printf("[Callback] Non-telemetry callback body: %s", string(body))
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok","received":true}`))
-	})
-
-	callbackServer := &http.Server{
-		Addr:    ":" + callbackPort,
-		Handler: callbackMux,
-	}
-
-	go func() {
-		log.Printf("[Callback] HTTP Callback receiver listening on :%s", callbackPort)
-		if err := callbackServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Callback server error: %v", err)
-		}
-	}()
-
-	// 3. Start REST / Dashboard API Server (Port 8000)
-	dashboardMux := http.NewServeMux()
-
-	// GET /api/devices - List all tracked ESP32s
-	dashboardMux.HandleFunc("/api/devices", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(registry.ListDevices())
-	})
-
-	// POST /api/command - Send action to a specific ESP32
-	dashboardMux.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req struct {
-			TargetIP string                 `json:"target_ip"`
-			Port     int                    `json:"port"`
-			Payload  map[string]interface{} `json:"payload"`
-		}
-
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		if req.Port == 0 {
-			req.Port = 8443
-		}
-		if req.TargetIP == "" {
-			http.Error(w, "target_ip is required", http.StatusBadRequest)
-			return
-		}
-
-		cmdCtx, cmdCancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cmdCancel()
-
-		resp, err := registry.SendHTTPCommand(cmdCtx, req.TargetIP, req.Port, req.Payload)
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":    false,
-				"error": err.Error(),
-				"body":  string(resp),
-			})
-			return
-		}
-
-		var jsonResp interface{}
-		if err := json.Unmarshal(resp, &jsonResp); err == nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":   true,
-				"body": jsonResp,
-			})
-		} else {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ok":   true,
-				"body": string(resp),
-			})
-		}
-	})
-
-	// Simple status probe
-	dashboardMux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"online","time":"%s"}`, time.Now().Format(time.RFC3339))
-	})
-
-	dashboardServer := &http.Server{
-		Addr:    ":" + dashboardPort,
-		Handler: dashboardMux,
-	}
-
-	go func() {
-		log.Printf("[Dashboard API] REST API listening on :%s", dashboardPort)
-		if err := dashboardServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Dashboard server error: %v", err)
-		}
-	}()
-
-	// Graceful shutdown handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-
-	log.Println("Shutting down server gracefully...")
-	cancel()
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	callbackServer.Shutdown(shutdownCtx)
-	dashboardServer.Shutdown(shutdownCtx)
+	callbackSrv.Shutdown(shutdownCtx)
+	dashboardSrv.Shutdown(shutdownCtx)
 	log.Println("Server stopped cleanly.")
 }

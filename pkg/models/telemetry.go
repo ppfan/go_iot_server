@@ -2,7 +2,13 @@ package models
 
 import "time"
 
-// TelemetryPayload represents the JSON sent by an ESP32 device.
+// Callback types sent by the firmware in the "type" field.
+const (
+	TypeDeviceStatus    = "device_status"
+	TypeSpeedtestResult = "speedtest_result"
+)
+
+// TelemetryPayload is the device_status JSON built by build_telemetry_json() in data_server.c.
 type TelemetryPayload struct {
 	Type            string `json:"type"`
 	Status          string `json:"status"`
@@ -16,22 +22,29 @@ type TelemetryPayload struct {
 	IP              string `json:"ip"`
 }
 
-// DeviceCommand represents an action sent from the Go server to an ESP32.
-type DeviceCommand struct {
-	Action      string `json:"action,omitempty"`
-	Relay       *int   `json:"relay,omitempty"`
-	Speedtest   bool   `json:"speedtest,omitempty"`
-	DurationSec int    `json:"duration_sec,omitempty"`
-	Mode        string `json:"mode,omitempty"`
-	NewKey      string `json:"new_key,omitempty"`
-	KeyID       string `json:"key_id,omitempty"`
+// SpeedtestResult is the speedtest_result JSON built in speedtest.c.
+// Mode "both" fills the dl_*/ul_* fields; single-direction modes fill Mode/Mbps/Bytes.
+type SpeedtestResult struct {
+	Type      string  `json:"type"`
+	Mode      string  `json:"mode,omitempty"`
+	Mbps      float64 `json:"mbps,omitempty"`
+	Bytes     int64   `json:"bytes,omitempty"`
+	DLMbps    float64 `json:"dl_mbps,omitempty"`
+	DLBytes   int64   `json:"dl_bytes,omitempty"`
+	ULMbps    float64 `json:"ul_mbps,omitempty"`
+	ULBytes   int64   `json:"ul_bytes,omitempty"`
+	DurationS float64 `json:"duration_s"`
 }
 
-// DeviceInfo represents an active or registered ESP32 in the fleet registry.
+// DeviceInfo is the dashboard view of a fleet device. It never contains key material.
 type DeviceInfo struct {
 	ID            string            `json:"id"`
 	IP            string            `json:"ip"`
-	LastSeen      time.Time         `json:"last_seen"`
+	KeyID         string            `json:"key_id,omitempty"`
+	RotationOpen  bool              `json:"rotation_pending"`
+	LastSeen      *time.Time        `json:"last_seen,omitempty"`
 	IsOnline      bool              `json:"is_online"`
 	LastTelemetry *TelemetryPayload `json:"last_telemetry,omitempty"`
+	LastSpeedtest *SpeedtestResult  `json:"last_speedtest,omitempty"`
+	LastError     string            `json:"last_error,omitempty"`
 }
