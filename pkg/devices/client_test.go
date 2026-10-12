@@ -51,6 +51,7 @@ func TestCommandBody(t *testing.T) {
 // implements rotate_hmac.
 type fakeDevice struct {
 	hold      chan struct{} // if set, requests block until it is closed
+	entered   chan struct{} // if set, receives once per request before blocking on hold
 	key       string
 	prevKey   string
 	gotHeader http.Header
@@ -58,6 +59,9 @@ type fakeDevice struct {
 }
 
 func (d *fakeDevice) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if d.entered != nil {
+		d.entered <- struct{}{}
+	}
 	if d.hold != nil {
 		<-d.hold
 	}
@@ -160,23 +164,25 @@ func TestRotateKeyLostAckIsRecoverable(t *testing.T) {
 }
 
 func TestOverlappingRequestIsBusy(t *testing.T) {
-	dev := &fakeDevice{key: testKey, hold: make(chan struct{})}
+	dev := &fakeDevice{key: testKey, hold: make(chan struct{}), entered: make(chan struct{}, 1)}
 	c, _ := setup(t, dev)
-	done := make(chan error)
+	done := make(chan error, 1)
 	go func() {
 		_, err := c.Send(context.Background(), "n1", Command{Name: "relay_toggle"})
 		done <- err
 	}()
-	// Wait until the first request holds the device lock.
-	for i := 0; i < 100; i++ {
-		if _, err := c.Send(context.Background(), "n1", Command{Name: "relay_status"}); errors.Is(err, ErrBusy) {
-			close(dev.hold)
-			if err := <-done; err != nil {
-				t.Fatal(err)
-			}
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	// The request reaches the device only while it holds the device lock.
+	select {
+	case <-dev.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached the device")
 	}
-	t.Fatal("second request was not rejected as busy")
+	_, err := c.Send(context.Background(), "n1", Command{Name: "relay_status"})
+	close(dev.hold)
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("second request: err = %v, want ErrBusy", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }
